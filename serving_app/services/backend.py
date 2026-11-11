@@ -1,11 +1,17 @@
 """vLLM 백엔드 연결. 같은 파드(또는 배포된 다른 파드)의 vLLM 에 OpenAI 호환 방식으로 요청한다."""
 import json
 
-from openai import AsyncOpenAI
+from langfuse import get_client
+from langfuse.openai import AsyncOpenAI
 
 from ..core.config import RESOURCE_DIR, settings
 from ..schemas.chat import ChatResponse, Usage
 
+# Langfuse 클라이언트. 환경 변수 LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY, LANGFUSE_BASE_URL 로 연결한다(관측 단원 교안 02)
+# 키가 없으면(배포 전 테스트) 경고 한 줄을 남기고 기록 없이 동작한다
+langfuse = get_client()
+
+# 관측 단원: openai 대신 langfuse.openai 의 AsyncOpenAI 를 쓴다. 사용법은 같고, 호출마다 모델 호출 기록(generation)을 Langfuse 로 보낸다
 # 비동기 클라이언트는 이 파일을 불러올 때 하나만 만들어 모든 요청이 함께 쓴다(요청마다 만들면 연결 준비를 반복한다)
 # 만들 때는 연결을 열지 않는다. 첫 요청 때 연 연결을 연결풀에 두고 재사용하다가, 앱 조립 파일의 lifespan 이 종료 때 닫는다
 # max_retries=0: 실패를 숨기지 않고 바로 오류로 받는다(다시 시도할지는 서빙 API 가 정한다)

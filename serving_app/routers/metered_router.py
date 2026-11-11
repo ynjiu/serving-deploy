@@ -7,15 +7,16 @@ import json
 from datetime import date
 from typing import Literal
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Response
 from fastapi.responses import StreamingResponse
+from langfuse import propagate_attributes
 
 from ..core.config import settings
 from ..core.metrics import OUTPUT_TOKENS
 from ..dependencies.security import check_rate_limit, get_db, require_service_key
 from ..repositories.key_store import record_usage, usage_summary
 from ..schemas.chat import ChatRequest, ChatResponse
-from ..services.backend import ask_vllm, make_system_prompt, open_vllm_stream, to_chat_response
+from ..services.backend import ask_vllm, langfuse, make_system_prompt, open_vllm_stream, to_chat_response
 from ..services.streaming import relay_stream
 
 metered_router = APIRouter(prefix="/v1", tags=["상담(사용량 기록)"])
@@ -41,12 +42,26 @@ THINK_LIMITS = {"labor": settings.max_tokens_think_labor, "lease": settings.max_
 async def metered_chat(
     desk: Literal["labor", "lease"],
     request: ChatRequest,
+    response: Response,  # 응답 헤더(X-Trace-Id)를 붙일 응답 객체
     client: dict = Depends(check_rate_limit),
     connection=Depends(get_db),  # lifespan 이 연 DB 연결
 ):
-    """상담 답을 돌려주고, 키별 사용량과 창구별 출력 토큰 수를 기록합니다."""
-    # 1) desk 에 맞는 시스템 메시지로 vLLM 에 묻는다(desk 가 labor, lease 가 아니면 422)
-    completion = await ask_vllm(SYSTEM_PROMPTS[desk], request.question, request.think, max_tokens_think=THINK_LIMITS[desk])
+    """상담 질문 하나의 답을 돌려주고, 그 요청의 토큰 사용량을 키별로 기록한다. 요청 하나를 Langfuse trace 하나로 남긴다."""
+    # 0) 관측 단원: 상담 요청 하나를 span 으로 감싼다. 그 안에서 부른 vLLM 호출은 langfuse.openai 가 generation 으로 남긴다
+    #    propagate_attributes 의 값은 이 span 과 안쪽 generation 에 모두 붙는다. user_id 는 key_id(Langfuse 는 US-ASCII 200자 이하만 받는다)
+    with langfuse.start_as_current_observation(as_type="span", name=f"{desk}-chat", input={"question": request.question}) as span:
+        with propagate_attributes(
+            user_id=str(client["key_id"]),
+            tags=[desk],
+            version=settings.image_tag,
+            metadata={"plan": client["plan"], "think": str(request.think)},
+        ):
+            # 1) desk 에 맞는 시스템 메시지로 vLLM 에 묻는다(desk 가 labor, lease 가 아니면 422)
+            completion = await ask_vllm(SYSTEM_PROMPTS[desk], request.question, request.think, max_tokens_think=THINK_LIMITS[desk])
+
+        # span 의 출력에 끝난 이유를 남기고, trace id 를 응답 헤더로 돌려준다
+        span.update(output={"finish_reason": completion.choices[0].finish_reason})
+        response.headers["X-Trace-Id"] = span.trace_id
 
     # 2) 그 요청의 토큰 사용량을 기록한다. client 는 check_rate_limit 을 통과한 키다
     usage = completion.usage
